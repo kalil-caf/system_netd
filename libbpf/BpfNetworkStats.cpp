@@ -25,8 +25,8 @@
 #include "android-base/file.h"
 #include "android-base/strings.h"
 #include "android-base/unique_fd.h"
+#include "bpf/BpfMap.h"
 #include "bpf/BpfNetworkStats.h"
-#include "bpf/BpfUtils.h"
 
 #ifdef LOG_TAG
 #undef LOG_TAG
@@ -37,81 +37,72 @@
 namespace android {
 namespace bpf {
 
-
-// The limit for stats received by a unknown interface;
-static const int64_t MAX_UNKNOWN_IFACE_BYTES = 100*1000;
+using netdutils::Status;
 
 static constexpr uint32_t BPF_OPEN_FLAGS = BPF_F_RDONLY;
 
-int bpfGetUidStatsInternal(uid_t uid, Stats* stats, const base::unique_fd& map_fd) {
-    struct StatsKey nonExistentKey = NONEXISTENT_STATSKEY;
-    struct StatsValue dummyValue;
-    auto processUidStats = [uid, stats](void *key, const base::unique_fd& map_fd) {
-        if (((StatsKey *) key)->uid != uid) {
-            return 0;
-        }
-        StatsValue statsEntry;
-        int ret = bpf::findMapEntry(map_fd, key, &statsEntry);
-        if (ret) return -errno;
-        stats->rxPackets += statsEntry.rxPackets;
-        stats->txPackets += statsEntry.txPackets;
-        stats->rxBytes += statsEntry.rxBytes;
-        stats->txBytes += statsEntry.txBytes;
-        return 0;
-    };
-    return bpfIterateMap(nonExistentKey, dummyValue, map_fd, processUidStats);
+int bpfGetUidStatsInternal(uid_t uid, Stats* stats,
+                           const BpfMap<uint32_t, StatsValue>& appUidStatsMap) {
+    auto statsEntry = appUidStatsMap.readValue(uid);
+    if (isOk(statsEntry)) {
+        stats->rxPackets = statsEntry.value().rxPackets;
+        stats->txPackets = statsEntry.value().txPackets;
+        stats->rxBytes = statsEntry.value().rxBytes;
+        stats->txBytes = statsEntry.value().txBytes;
+    }
+    return -statsEntry.status().code();
 }
 
 int bpfGetUidStats(uid_t uid, Stats* stats) {
-    base::unique_fd uidStatsMap(bpf::mapRetrieve(UID_STATS_MAP_PATH, BPF_OPEN_FLAGS));
-    if (uidStatsMap < 0) {
+    BpfMap<uint32_t, StatsValue> appUidStatsMap(
+        mapRetrieve(APP_UID_STATS_MAP_PATH, BPF_OPEN_FLAGS));
+
+    if (!appUidStatsMap.isValid()) {
         int ret = -errno;
-        ALOGE("Opening map fd from %s failed: %s", UID_STATS_MAP_PATH, strerror(errno));
+        ALOGE("Opening appUidStatsMap(%s) failed: %s", UID_STATS_MAP_PATH, strerror(errno));
         return ret;
     }
-    return bpfGetUidStatsInternal(uid, stats, uidStatsMap);
+    return bpfGetUidStatsInternal(uid, stats, appUidStatsMap);
 }
 
 int bpfGetIfaceStatsInternal(const char* iface, Stats* stats,
-                             const base::unique_fd& ifaceStatsMapFd,
-                             const base::unique_fd& ifaceNameMapFd) {
-    uint32_t nonExistentKey = NONEXISTENT_IFACE_STATS_KEY;
-    struct StatsValue dummyValue;
+                             const BpfMap<uint32_t, StatsValue>& ifaceStatsMap,
+                             const BpfMap<uint32_t, IfaceValue>& ifaceNameMap) {
     int64_t unknownIfaceBytesTotal = 0;
     stats->tcpRxPackets = -1;
     stats->tcpTxPackets = -1;
-    auto processIfaceStats = [iface, stats, &ifaceNameMapFd, &unknownIfaceBytesTotal](
-                              void* key, const base::unique_fd& ifaceStatsMapFd) {
+    const auto processIfaceStats = [iface, stats, &ifaceNameMap, &unknownIfaceBytesTotal]
+                                   (const uint32_t& key,
+                                    const BpfMap<uint32_t, StatsValue>& ifaceStatsMap) {
         char ifname[IFNAMSIZ];
-        int ifIndex = *(int *)key;
-        if (getIfaceNameFromMap(ifaceNameMapFd, ifaceStatsMapFd, ifIndex, ifname, &ifIndex,
+        if (getIfaceNameFromMap(ifaceNameMap, ifaceStatsMap, key, ifname, key,
                                 &unknownIfaceBytesTotal)) {
-            return 0;
+            return netdutils::status::ok;
         }
         if (!iface || !strcmp(iface, ifname)) {
             StatsValue statsEntry;
-            int ret = bpf::findMapEntry(ifaceStatsMapFd, &ifIndex, &statsEntry);
-            if (ret) return -errno;
+            ASSIGN_OR_RETURN(statsEntry, ifaceStatsMap.readValue(key));
             stats->rxPackets += statsEntry.rxPackets;
             stats->txPackets += statsEntry.txPackets;
             stats->rxBytes += statsEntry.rxBytes;
             stats->txBytes += statsEntry.txBytes;
         }
-        return 0;
+        return netdutils::status::ok;
     };
-    return bpfIterateMap(nonExistentKey, dummyValue, ifaceStatsMapFd, processIfaceStats);
+    return -ifaceStatsMap.iterate(processIfaceStats).code();
 }
 
 int bpfGetIfaceStats(const char* iface, Stats* stats) {
-    base::unique_fd ifaceStatsMap(bpf::mapRetrieve(IFACE_STATS_MAP_PATH, BPF_OPEN_FLAGS));
+    BpfMap<uint32_t, StatsValue> ifaceStatsMap(mapRetrieve(IFACE_STATS_MAP_PATH, BPF_OPEN_FLAGS));
     int ret;
-    if (ifaceStatsMap < 0) {
+    if (!ifaceStatsMap.isValid()) {
         ret = -errno;
         ALOGE("get ifaceStats map fd failed: %s", strerror(errno));
         return ret;
     }
-    base::unique_fd ifaceIndexNameMap(bpf::mapRetrieve(IFACE_INDEX_NAME_MAP_PATH, BPF_OPEN_FLAGS));
-    if (ifaceIndexNameMap < 0) {
+    BpfMap<uint32_t, IfaceValue> ifaceIndexNameMap(
+        mapRetrieve(IFACE_INDEX_NAME_MAP_PATH, BPF_OPEN_FLAGS));
+    if (!ifaceIndexNameMap.isValid()) {
         ret = -errno;
         ALOGE("get ifaceIndexName map fd failed: %s", strerror(errno));
         return ret;
@@ -123,9 +114,9 @@ stats_line populateStatsEntry(const StatsKey& statsKey, const StatsValue& statsE
                               const char* ifname) {
     stats_line newLine;
     strlcpy(newLine.iface, ifname, sizeof(newLine.iface));
-    newLine.uid = statsKey.uid;
-    newLine.set = statsKey.counterSet;
-    newLine.tag = statsKey.tag;
+    newLine.uid = (int32_t)statsKey.uid;
+    newLine.set = (int32_t)statsKey.counterSet;
+    newLine.tag = (int32_t)statsKey.tag;
     newLine.rxPackets = statsEntry.rxPackets;
     newLine.txPackets = statsEntry.txPackets;
     newLine.rxBytes = statsEntry.rxBytes;
@@ -133,80 +124,53 @@ stats_line populateStatsEntry(const StatsKey& statsKey, const StatsValue& statsE
     return newLine;
 }
 
-void maybeLogUnknownIface(int ifaceIndex, const base::unique_fd& statsMapFd, void* curKey,
-                          int64_t* unknownIfaceBytesTotal) {
-    // Have we already logged an error?
-    if (*unknownIfaceBytesTotal == -1) {
-        return;
-    }
-
-    // Are we undercounting enough data to be worth logging?
-    StatsValue statsEntry;
-    if (bpf::findMapEntry(statsMapFd, curKey, &statsEntry) < 0) {
-        // No data is being undercounted.
-        return;
-    }
-
-    *unknownIfaceBytesTotal += (statsEntry.rxBytes + statsEntry.txBytes);
-    if (*unknownIfaceBytesTotal >= MAX_UNKNOWN_IFACE_BYTES) {
-            ALOGE("Unknown name for ifindex %d with more than %" PRId64 " bytes of traffic",
-                  ifaceIndex, *unknownIfaceBytesTotal);
-            *unknownIfaceBytesTotal = -1;
-    }
-}
-
-int getIfaceNameFromMap(const base::unique_fd& ifaceMapFd, const base::unique_fd& statsMapFd,
-                        uint32_t ifaceIndex, char* ifname, void* curKey,
-                        int64_t* unknownIfaceBytesTotal) {
-    if (bpf::findMapEntry(ifaceMapFd, &ifaceIndex, ifname) < 0) {
-        maybeLogUnknownIface(ifaceIndex, statsMapFd, curKey, unknownIfaceBytesTotal);
-        return -ENODEV;
-    }
-    return 0;
-}
-
 int parseBpfNetworkStatsDetailInternal(std::vector<stats_line>* lines,
                                        const std::vector<std::string>& limitIfaces, int limitTag,
-                                       int limitUid, const base::unique_fd& statsMapFd,
-                                       const base::unique_fd& ifaceMapFd) {
+                                       int limitUid, const BpfMap<StatsKey, StatsValue>& statsMap,
+                                       const BpfMap<uint32_t, IfaceValue>& ifaceMap) {
     int64_t unknownIfaceBytesTotal = 0;
-    struct StatsKey nonExistentKey = NONEXISTENT_STATSKEY;
-    struct StatsValue dummyValue;
-    auto processDetailUidStats = [lines, &limitIfaces, limitTag, limitUid,
-                                  &unknownIfaceBytesTotal, &ifaceMapFd]
-                                  (void* key, const base::unique_fd& statsMapFd) {
-        struct StatsKey curKey = * (struct StatsKey*)key;
+    const auto processDetailUidStats = [lines, &limitIfaces, &limitTag, &limitUid,
+                                        &unknownIfaceBytesTotal,
+                                        &ifaceMap](const StatsKey& key,
+                                                   const BpfMap<StatsKey, StatsValue>& statsMap) {
         char ifname[IFNAMSIZ];
-        if (getIfaceNameFromMap(ifaceMapFd, statsMapFd, curKey.ifaceIndex, ifname, &curKey,
+        if (getIfaceNameFromMap(ifaceMap, statsMap, key.ifaceIndex, ifname, key,
                                 &unknownIfaceBytesTotal)) {
-            return 0;
+            return netdutils::status::ok;
         }
         std::string ifnameStr(ifname);
         if (limitIfaces.size() > 0 &&
             std::find(limitIfaces.begin(), limitIfaces.end(), ifnameStr) == limitIfaces.end()) {
             // Nothing matched; skip this line.
-            return 0;
+            return netdutils::status::ok;
         }
-        if (limitTag != TAG_ALL && uint32_t(limitTag) != curKey.tag) {
-            return 0;
+        if (limitTag != TAG_ALL && uint32_t(limitTag) != key.tag) {
+            return netdutils::status::ok;
         }
-        if (limitUid != UID_ALL && uint32_t(limitUid) != curKey.uid) {
-            return 0;
+        if (limitUid != UID_ALL && uint32_t(limitUid) != key.uid) {
+            return netdutils::status::ok;
         }
         StatsValue statsEntry;
-        if (bpf::findMapEntry(statsMapFd, &curKey, &statsEntry) < 0) return -errno;
-        lines->push_back(populateStatsEntry(curKey, statsEntry, ifname));
-        return 0;
+        ASSIGN_OR_RETURN(statsEntry, statsMap.readValue(key));
+        lines->push_back(populateStatsEntry(key, statsEntry, ifname));
+        return netdutils::status::ok;
     };
-    return bpfIterateMap(nonExistentKey, dummyValue, statsMapFd, processDetailUidStats);
+    Status res = statsMap.iterate(processDetailUidStats);
+    if (!isOk(res)) {
+        ALOGE("failed to iterate per uid Stats map for detail traffic stats: %s",
+              strerror(res.code()));
+        return -res.code();
+    }
+    return 0;
 }
 
 int parseBpfNetworkStatsDetail(std::vector<stats_line>* lines,
                                const std::vector<std::string>& limitIfaces, int limitTag,
                                int limitUid) {
     int ret = 0;
-    base::unique_fd ifaceIndexNameMap(bpf::mapRetrieve(IFACE_INDEX_NAME_MAP_PATH, BPF_OPEN_FLAGS));
-    if (ifaceIndexNameMap < 0) {
+    BpfMap<uint32_t, IfaceValue> ifaceIndexNameMap(
+        mapRetrieve(IFACE_INDEX_NAME_MAP_PATH, BPF_OPEN_FLAGS));
+    if (!ifaceIndexNameMap.isValid()) {
         ret = -errno;
         ALOGE("get ifaceIndexName map fd failed: %s", strerror(errno));
         return ret;
@@ -214,8 +178,8 @@ int parseBpfNetworkStatsDetail(std::vector<stats_line>* lines,
 
     // If the caller did not pass in TAG_NONE, read tag data.
     if (limitTag != TAG_NONE) {
-        base::unique_fd tagStatsMap(bpf::mapRetrieve(TAG_STATS_MAP_PATH, BPF_OPEN_FLAGS));
-        if (tagStatsMap < 0) {
+        BpfMap<StatsKey, StatsValue> tagStatsMap(mapRetrieve(TAG_STATS_MAP_PATH, BPF_OPEN_FLAGS));
+        if (!tagStatsMap.isValid()) {
             ret = -errno;
             ALOGE("get tagStats map fd failed: %s", strerror(errno));
             return ret;
@@ -228,8 +192,8 @@ int parseBpfNetworkStatsDetail(std::vector<stats_line>* lines,
     // If the caller did not pass in a specific tag (i.e., if limitTag is TAG_NONE(0) or
     // TAG_ALL(-1)) read UID data.
     if (limitTag == TAG_NONE || limitTag == TAG_ALL) {
-        base::unique_fd uidStatsMap(bpf::mapRetrieve(UID_STATS_MAP_PATH, BPF_OPEN_FLAGS));
-        if (uidStatsMap < 0) {
+        BpfMap<StatsKey, StatsValue> uidStatsMap(mapRetrieve(UID_STATS_MAP_PATH, BPF_OPEN_FLAGS));
+        if (!uidStatsMap.isValid()) {
             ret = -errno;
             ALOGE("Opening map fd from %s failed: %s", UID_STATS_MAP_PATH, strerror(errno));
             return ret;
@@ -240,79 +204,52 @@ int parseBpfNetworkStatsDetail(std::vector<stats_line>* lines,
     return ret;
 }
 
-uint64_t combineUidTag(const uid_t uid, const uint32_t tag) {
-    return (uint64_t)uid << 32 | tag;
-}
-
-// This function get called when the system_server decided to clean up the
-// tagStatsMap after it gethered the information of taggged socket stats. The
-// function go through all the entry in tagStatsMap and remove all the entry
-// for which the tag no longer exists.
-int cleanStatsMapInternal(const base::unique_fd& cookieTagMap, const base::unique_fd& tagStatsMap) {
-    uint64_t curCookie = 0;
-    uint64_t nextCookie = 0;
-    int res;
-    UidTag tmp_uidtag;
-    std::unordered_set<uint64_t> uidTagSet;
-    StatsKey curKey, nextKey;
-
-    // Find all the uid, tag pair exist in cookieTagMap.
-    while (bpf::getNextMapKey(cookieTagMap, &curCookie, &nextCookie) != -1) {
-        curCookie = nextCookie;
-        res = bpf::findMapEntry(cookieTagMap, &curCookie, &tmp_uidtag);
-        if (res < 0) {
-            // might be a concurrent delete, continue to check other entries.
-            continue;
+int parseBpfNetworkStatsDevInternal(std::vector<stats_line>* lines,
+                                    const BpfMap<uint32_t, StatsValue>& statsMap,
+                                    const BpfMap<uint32_t, IfaceValue>& ifaceMap) {
+    int64_t unknownIfaceBytesTotal = 0;
+    const auto processDetailIfaceStats = [lines, &unknownIfaceBytesTotal, &ifaceMap, &statsMap](
+                                             const uint32_t& key, const StatsValue& value,
+                                             const BpfMap<uint32_t, StatsValue>&) {
+        char ifname[IFNAMSIZ];
+        if (getIfaceNameFromMap(ifaceMap, statsMap, key, ifname, key, &unknownIfaceBytesTotal)) {
+            return netdutils::status::ok;
         }
-        uint64_t uidTag = combineUidTag(tmp_uidtag.uid, tmp_uidtag.tag);
-        uidTagSet.insert(uidTag);
+        StatsKey fakeKey = {
+            .uid = (uint32_t)UID_ALL, .counterSet = (uint32_t)SET_ALL, .tag = (uint32_t)TAG_NONE};
+        lines->push_back(populateStatsEntry(fakeKey, value, ifname));
+        return netdutils::status::ok;
+    };
+    Status res = statsMap.iterateWithValue(processDetailIfaceStats);
+    if (!isOk(res)) {
+        ALOGE("failed to iterate per uid Stats map for detail traffic stats: %s",
+              strerror(res.code()));
+        return -res.code();
     }
-
-    // Find all the entries in tagStatsMap where the key is not in the set of
-    // uid, tag pairs found above.
-    curKey = NONEXISTENT_STATSKEY;
-    std::vector<StatsKey> keyList;
-    while (bpf::getNextMapKey(tagStatsMap, &curKey, &nextKey) != -1) {
-        curKey = nextKey;
-        uint64_t uidTag = combineUidTag(curKey.uid, curKey.tag);
-        if (uidTagSet.find(uidTag) == uidTagSet.end()) {
-            keyList.push_back(curKey);
-        }
-    }
-
-    // Delete the entries
-    int size = keyList.size();
-    while (!keyList.empty()) {
-        StatsKey key = keyList.back();
-        keyList.pop_back();
-        res = bpf::deleteMapEntry(tagStatsMap, &key);
-        if (res < 0 && errno != ENOENT) {
-            res = -errno;
-            ALOGE("Failed to delete data(uid=%u, tag=%u): %s\n", key.uid, key.tag, strerror(errno));
-            return res;
-        }
-    }
-    ALOGD("finish clean up, %d stats entry cleaned", size);
     return 0;
 }
 
-int cleanStatsMap() {
-    base::unique_fd cookieTagMap(bpf::mapRetrieve(COOKIE_TAG_MAP_PATH, BPF_OPEN_FLAGS));
+int parseBpfNetworkStatsDev(std::vector<stats_line>* lines) {
     int ret = 0;
-    if (cookieTagMap < 0) {
+    BpfMap<uint32_t, IfaceValue> ifaceIndexNameMap(
+        mapRetrieve(IFACE_INDEX_NAME_MAP_PATH, BPF_OPEN_FLAGS));
+    if (!ifaceIndexNameMap.isValid()) {
         ret = -errno;
-        ALOGE("get cookieTag map fd failed: %s", strerror(errno));
+        ALOGE("get ifaceIndexName map fd failed: %s", strerror(errno));
         return ret;
     }
 
-    base::unique_fd tagStatsMap(bpf::mapRetrieve(TAG_STATS_MAP_PATH, BPF_OPEN_FLAGS));
-    if (tagStatsMap < 0) {
+    BpfMap<uint32_t, StatsValue> ifaceStatsMap(mapRetrieve(IFACE_STATS_MAP_PATH, BPF_OPEN_FLAGS));
+    if (!ifaceStatsMap.isValid()) {
         ret = -errno;
-        ALOGE("get tagStats map fd failed: %s", strerror(errno));
+        ALOGE("get ifaceStats map fd failed: %s", strerror(errno));
         return ret;
     }
+    return parseBpfNetworkStatsDevInternal(lines, ifaceStatsMap, ifaceIndexNameMap);
+}
 
-    return cleanStatsMapInternal(cookieTagMap, tagStatsMap);
+uint64_t combineUidTag(const uid_t uid, const uint32_t tag) {
+    return (uint64_t)uid << 32 | tag;
 }
 
 }  // namespace bpf

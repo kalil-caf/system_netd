@@ -16,10 +16,14 @@
 
 // const values shared by both kernel program and userspace bpfloader
 
-#define BPF_PROG_SEC_NAME "kern_prog"
+#define BPF_CGROUP_INGRESS_PROG_NAME "cgroup_ingress_prog"
+#define BPF_CGROUP_EGRESS_PROG_NAME "cgroup_egress_prog"
+#define XT_BPF_INGRESS_PROG_NAME "xt_ingress_prog"
+#define XT_BPF_EGRESS_PROG_NAME "xt_egress_prog"
 
 #define COOKIE_TAG_MAP 0xbfceaaffffffffff
 #define UID_COUNTERSET_MAP 0xbfdceeafffffffff
+#define APP_UID_STATS_MAP 0xbfa1daafffffffff
 #define UID_STATS_MAP 0xbfdaafffffffffff
 #define TAG_STATS_MAP 0xbfaaafffffffffff
 #define IFACE_STATS_MAP 0xbf1faceaafffffff

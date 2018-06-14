@@ -41,10 +41,17 @@ cc_binary {
     ],
 
     required: [
-        "cgroup_bpf_ingress_prog.o",
-        "cgroup_bpf_egress_prog.o",
-        "xt_bpf_ingress_prog.o",
-        "xt_bpf_egress_prog.o",
+        "bpf_kern.o",
     ],
 
+}
+
+bpf {
+    name: "bpf_kern.o",
+    srcs: ["bpf_kern.c"],
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+    include_dirs: ["system/netd/libbpf/include"],
 }

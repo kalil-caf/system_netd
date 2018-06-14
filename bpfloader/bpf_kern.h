@@ -14,6 +14,20 @@
  * limitations under the License.
  */
 
+/*
+ * This h file together with bpf_kern.c is used for compiling the eBPF kernel
+ * program. To generate the bpf_kern.o file manually, use the clang prebuilt in
+ * this android tree to compile the files with --target=bpf options. For
+ * example, in system/netd/ directory, execute the following command:
+ * $: ANDROID_BASE_DIRECTORY/prebuilts/clang/host/linux-x86/clang-4691093/bin/clang  \
+ *    -I ANDROID_BASE_DIRECTORY/bionic/libc/kernel/uapi/ \
+ *    -I ANDROID_BASE_DIRECTORY/system/netd/bpfloader/ \
+ *    -I ANDROID_BASE_DIRECTORY/bionic/libc/kernel/android/uapi/ \
+ *    -I ANDROID_BASE_DIRECTORY/bionic/libc/include \
+ *    -I ANDROID_BASE_DIRECTORY/system/netd/libbpf/include  \
+ *    --target=bpf -O2 -c bpfloader/bpf_kern.c -o bpfloader/bpf_kern.o
+ */
+
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/in.h>
@@ -150,6 +164,14 @@ static inline int bpf_owner_match(struct __sk_buff* skb, uint32_t uid) {
 }
 
 static __always_inline inline int bpf_traffic_account(struct __sk_buff* skb, int direction) {
+    uint32_t sock_uid = get_socket_uid(skb);
+    int match = bpf_owner_match(skb, sock_uid);
+    if ((direction == BPF_EGRESS) && (match == BPF_DROP)) {
+        // If an outbound packet is going to be dropped, we do not count that
+        // traffic.
+        return match;
+    }
+
     uint64_t cookie = get_socket_cookie(skb);
     struct uid_tag* utag = find_map_entry(COOKIE_TAG_MAP, &cookie);
     uint32_t uid, tag;
@@ -157,22 +179,21 @@ static __always_inline inline int bpf_traffic_account(struct __sk_buff* skb, int
         uid = utag->uid;
         tag = utag->tag;
     } else {
-        uid = get_socket_uid(skb);
+        uid = sock_uid;
         tag = 0;
     }
 
     struct stats_key key = {.uid = uid, .tag = tag, .counterSet = 0, .ifaceIndex = skb->ifindex};
 
-    uint32_t* counterSet;
-    counterSet = find_map_entry(UID_COUNTERSET_MAP, &uid);
-    if (counterSet) key.counterSet = *counterSet;
+    uint8_t* counterSet = find_map_entry(UID_COUNTERSET_MAP, &uid);
+    if (counterSet) key.counterSet = (uint32_t)*counterSet;
 
-    int ret;
     if (tag) {
         bpf_update_stats(skb, TAG_STATS_MAP, direction, &key);
     }
 
     key.tag = 0;
     bpf_update_stats(skb, UID_STATS_MAP, direction, &key);
-    return bpf_owner_match(skb, uid);
+    bpf_update_stats(skb, APP_UID_STATS_MAP, direction, &uid);
+    return match;
 }
